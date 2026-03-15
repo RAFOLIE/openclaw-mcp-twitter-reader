@@ -1,0 +1,28 @@
+{
+  "name": "mcp-twitter-reader",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "MCP server + CLI for reading Twitter/X tweet content and articles via browser automation",
+  "bin": {
+    "mcp-twitter-reader": "src/index.ts"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@mozilla/readability": "^0.5.0",
+    "chrome-remote-interface": "^0.34.0",
+    "jsdom": "^26.1.0",
+    "playwright": "^1.52.0",
+    "turndown": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^22.15.0",
+    "@types/turndown": "^5.0.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
