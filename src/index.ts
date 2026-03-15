@@ -50,10 +50,12 @@ async function withCdp<T>(fn: (client: CDP.Client) => Promise<T>): Promise<T> {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // ============================================================
-// get_tweet
+// get_tweet (with images)
 // ============================================================
 
-async function getTweetContent(url: string): Promise<{ text: string; error?: string }> {
+interface TweetImage { fileName: string; src: string }
+
+async function getTweetContent(url: string, includeImages: boolean = false): Promise<{ text: string; images?: TweetImage[]; error?: string }> {
   try {
     return await withCdp(async (client) => {
       await client.Page.navigate({ url });
@@ -134,6 +136,9 @@ async function getTweetContent(url: string): Promise<{ text: string; error?: str
       const parsed = JSON.parse((result as any).value);
       if (!parsed) return { text: "", error: "未找到推文内容" };
 
+      // Image download tracking (scope: withCdp callback)
+      let downloadedImages: Array<{ fileName: string; src: string }> = [];
+
       // Check for quoted tweet and fetch full content
       let quotedContent: string | null = null;
       if (parsed.quotedHandle) {
@@ -180,7 +185,54 @@ async function getTweetContent(url: string): Promise<{ text: string; error?: str
         }
 
         // Extract quoted tweet full content
-        // X long-form articles use h1/h2/headings, NOT data-testid="tweetText"
+        // When includeImages, scroll to load all images first
+        if (includeImages) {
+          for (let si = 0; si < 12; si++) {
+            await client.Runtime.evaluate({ expression: "window.scrollBy(0, 1500)" });
+            await sleep(1500);
+          }
+          await client.Runtime.evaluate({ expression: "window.scrollTo(0, 0)" });
+          await sleep(1000);
+        }
+
+        const treeWalkerJS = includeImages ? `
+            if (isLongForm) {
+              var imgIdx = 0, blocks = [], textBuf = '';
+              function flush() { if (textBuf.trim()) { blocks.push({t:'text',v:textBuf.trim()}); textBuf=''; } }
+              var cDiv = null;
+              main.querySelectorAll('div').forEach(function(d) {
+                if (!cDiv && d.querySelectorAll('h1').length >= 2 && d.querySelectorAll('img[src*="pbs.twimg.com/media/"]').length >= 2) cDiv = d;
+              });
+              var root = cDiv || main;
+              var walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+              var n;
+              while (n = walker.nextNode()) {
+                var tag = n.tagName.toLowerCase();
+                if (tag === 'h1' || tag === 'h2' || tag === 'h3') {
+                  flush(); var lv = tag === 'h1' ? '#' : tag === 'h2' ? '##' : '###';
+                  blocks.push({t:'h', v: lv + ' ' + n.textContent.trim()});
+                } else if (tag === 'pre') {
+                  flush(); blocks.push({t:'code', v: n.textContent.trim()});
+                } else if (tag === 'ul' || tag === 'ol') {
+                  flush(); var items = [];
+                  n.querySelectorAll(':scope > li').forEach(function(li) { items.push(li.textContent.trim()); });
+                  blocks.push({t:'list', ord: tag === 'ol', items: items});
+                } else if (tag === 'img') {
+                  var src = n.getAttribute('src') || '';
+                  if (src.includes('pbs.twimg.com/media/')) {
+                    flush(); imgIdx++;
+                    var ext = src.match(/format=(\\w+)/) ? src.match(/format=(\\w+)/)[1] : 'jpg';
+                    blocks.push({t:'img', idx: imgIdx, ext: ext === 'png' ? 'png' : 'jpg', src: src.replace(/name=[^&]+/, 'name=large')});
+                  }
+                } else if (tag === 'blockquote') {
+                  flush(); blocks.push({t:'quote', v: n.textContent.trim()});
+                }
+              }
+              flush();
+              return JSON.stringify({author: author, time: time, url: location.href, isLongForm: true, imgCount: imgIdx, blocks: blocks});
+            }
+            ` : "";
+
         const { result: quotedResult } = await client.Runtime.evaluate({
           expression: `(function() {
             var articles = document.querySelectorAll('article[data-testid="tweet"]');
@@ -190,30 +242,58 @@ async function getTweetContent(url: string): Promise<{ text: string; error?: str
             var author = userEl ? userEl.textContent.trim() : '';
             var timeEl = main.querySelector('time');
             var time = timeEl ? timeEl.textContent.trim() : '';
-            // Try tweetText first (regular tweets)
-            var texts = [];
+            var tweetTexts = [];
             main.querySelectorAll('[data-testid="tweetText"]').forEach(function(el) {
               var t = el.textContent.trim();
-              if (t) texts.push(t);
+              if (t) tweetTexts.push(t);
             });
-            var content = texts.join('\\n\\n');
-            // If no tweetText, it's a long-form article - use full article text
-            if (content.length < 50) {
-              content = main.textContent.trim();
-            }
-            return JSON.stringify({ author: author, time: time, content: content, url: location.href });
+            var isLongForm = tweetTexts.join('').length < 50 && main.querySelectorAll('h1').length >= 2;
+            ${treeWalkerJS}
+            var content = tweetTexts.join('\\n\\n');
+            if (content.length < 50) content = main.textContent.trim();
+            return JSON.stringify({author: author, time: time, url: location.href, isLongForm: false, content: content});
           })()`,
         });
 
         const quotedParsed = JSON.parse((quotedResult as any).value);
         if (quotedParsed) {
-          quotedContent = [
-            "## " + quotedParsed.author,
-            "📅 " + quotedParsed.time,
-            "🔗 " + quotedParsed.url,
-            "",
-            quotedParsed.content,
-          ].join("\n");
+          if (quotedParsed.isLongForm && quotedParsed.blocks) {
+            const mdLines: string[] = [];
+            for (const b of quotedParsed.blocks) {
+              switch (b.t) {
+                case "h": mdLines.push(b.v); break;
+                case "text": mdLines.push(b.v); break;
+                case "code": mdLines.push("```\n" + b.v + "\n```"); break;
+                case "list":
+                  (b.items as string[]).forEach((item, idx) => {
+                    mdLines.push((b.ord ? `${idx + 1}. ` : "- ") + item);
+                  });
+                  break;
+                case "img": {
+                  const fileName = `image_${String(b.idx).padStart(2, "0")}.${b.ext}`;
+                  mdLines.push("", `![${fileName}](${fileName})`, "");
+                  downloadedImages.push({ fileName, src: (b as any).src });
+                  break;
+                }
+                case "quote": mdLines.push("> " + b.v); break;
+              }
+            }
+            quotedContent = [
+              "## " + quotedParsed.author,
+              "📅 " + quotedParsed.time,
+              "🔗 " + quotedParsed.url,
+              "",
+              mdLines.join("\n\n"),
+            ].join("\n");
+          } else {
+            quotedContent = [
+              "## " + quotedParsed.author,
+              "📅 " + quotedParsed.time,
+              "🔗 " + quotedParsed.url,
+              "",
+              quotedParsed.content,
+            ].join("\n");
+          }
         }
       }
 
@@ -233,7 +313,7 @@ async function getTweetContent(url: string): Promise<{ text: string; error?: str
         parts.push(quotedContent);
       }
 
-      return { text: parts.join("\n") };
+      return { text: parts.join("\n"), images: downloadedImages };
     });
   } catch (err: any) {
     return { text: "", error: err.message };
@@ -486,10 +566,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "get_tweet",
-      description: "获取推文完整内容。连接已登录 X 的浏览器，展开'显示更多'，提取作者、时间、全文。返回 Markdown。",
+      description: "获取推文完整内容。支持 include_images=true 时，自动提取引用推文全文和配图，返回带图片引用的 Markdown。",
       inputSchema: {
         type: "object" as const,
-        properties: { url: { type: "string" as const, description: "推文 URL" } },
+        properties: {
+          url: { type: "string" as const, description: "推文 URL" },
+          include_images: { type: "boolean" as const, description: "是否提取配图，默认 false" },
+          output_dir: { type: "string" as const, description: "图片保存目录，默认 ./images" },
+        },
         required: ["url"],
       },
     },
@@ -530,7 +614,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "get_tweet") {
     const url = args?.url as string;
     if (!url) return { content: [{ type: "text", text: "Error: url is required" }] };
-    const r = await getTweetContent(url);
+    const includeImages = args?.include_images as boolean || false;
+    const outputDir = (args?.output_dir as string) || "./images";
+    const r = await getTweetContent(url, includeImages);
+    // Download images if requested
+    if (includeImages && r.images && r.images.length > 0) {
+      const absDir = path.resolve(outputDir);
+      if (!fs.existsSync(absDir)) fs.mkdirSync(absDir, { recursive: true });
+      const saved: string[] = [];
+      for (const img of r.images) {
+        try {
+          const res = await fetchWithProxy(img.src);
+          if (!res.ok) continue;
+          const buffer = Buffer.from(await res.arrayBuffer());
+          fs.writeFileSync(path.join(absDir, img.fileName), buffer);
+          saved.push(img.fileName);
+        } catch { /* skip */ }
+      }
+      if (saved.length > 0) {
+        const footer = "\n\n---\n🖼️ " + saved.length + " 张图片已保存到 " + absDir;
+        return { content: [{ type: "text", text: (r.error ? "Error: " + r.error : r.text + footer) }] };
+      }
+    }
     return { content: [{ type: "text", text: r.error ? "Error: " + r.error : r.text }] };
   }
   if (name === "get_timeline") {
@@ -563,7 +668,7 @@ async function cliMain() {
   const arg = process.argv[3];
   if (!command || command === "--help" || command === "-h") {
     console.error("Usage: mcp-twitter-reader <command> [args]");
-    console.error("  get-tweet <url>        获取推文完整内容");
+    console.error("  get-tweet <url> [--images] [--dir <path>]  获取推文内容（--images 下载配图）");
     console.error("  get-timeline [count]   获取首页推文列表");
     console.error("  get-article <url>      获取文章完整内容");
     console.error("  download-images <url> [dir] 下载推文配图");
@@ -571,8 +676,25 @@ async function cliMain() {
   }
   if (command === "get-tweet") {
     if (!arg) { console.error("Error: url is required"); process.exit(1); }
-    const r = await getTweetContent(arg);
-    console.log(r.error ? "Error: " + r.error : r.text);
+    const withImages = process.argv.includes("--images");
+    const dirIdx = process.argv.indexOf("--dir");
+    const dir = dirIdx !== -1 && process.argv[dirIdx + 1] ? process.argv[dirIdx + 1] : "./images";
+    const r = await getTweetContent(arg, withImages);
+    if (withImages && r.images && r.images.length > 0) {
+      const absDir = path.resolve(dir);
+      if (!fs.existsSync(absDir)) fs.mkdirSync(absDir, { recursive: true });
+      for (const img of r.images) {
+        try {
+          const res = await fetchWithProxy(img.src);
+          if (!res.ok) continue;
+          const buffer = Buffer.from(await res.arrayBuffer());
+          fs.writeFileSync(path.join(absDir, img.fileName), buffer);
+        } catch { /* skip */ }
+      }
+      console.log(r.text + "\n\n---\n🖼️ " + r.images.length + " 张图片已保存到 " + absDir);
+    } else {
+      console.log(r.error ? "Error: " + r.error : r.text);
+    }
     process.exit(r.error ? 1 : 0);
   }
   if (command === "get-timeline") {

@@ -1,0 +1,36 @@
+﻿        // X long-form articles use h1/h2/headings, NOT data-testid="tweetText"
+        const { result: quotedResult } = await client.Runtime.evaluate({
+          expression: `(function() {
+            var articles = document.querySelectorAll('article[data-testid="tweet"]');
+            if (!articles.length) return null;
+            var main = articles[0];
+            var userEl = main.querySelector('[data-testid="User-Name"]');
+            var author = userEl ? userEl.textContent.trim() : '';
+            var timeEl = main.querySelector('time');
+            var time = timeEl ? timeEl.textContent.trim() : '';
+            // Try tweetText first (regular tweets)
+            var texts = [];
+            main.querySelectorAll('[data-testid="tweetText"]').forEach(function(el) {
+              var t = el.textContent.trim();
+              if (t) texts.push(t);
+            });
+            var content = texts.join('\\n\\n');
+            // If no tweetText, it's a long-form article - use full article text
+            if (content.length < 50) {
+              content = main.textContent.trim();
+            }
+            return JSON.stringify({ author: author, time: time, content: content, url: location.href });
+          })()`,
+        });
+
+        const quotedParsed = JSON.parse((quotedResult as any).value);
+        if (quotedParsed) {
+          quotedContent = [
+            "## " + quotedParsed.author,
+            "📅 " + quotedParsed.time,
+            "🔗 " + quotedParsed.url,
+            "",
+            quotedParsed.content,
+          ].join("\n");
+        }
+      }
