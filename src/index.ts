@@ -8,6 +8,9 @@ import CDP from "chrome-remote-interface";
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
+import * as fs from "fs";
+import * as path from "path";
+import { ProxyAgent, fetch as undiciFetch } from "undici";
 
 const CDP_URL = process.env.CDP_URL || "http://localhost:18800";
 
@@ -370,6 +373,107 @@ async function getArticleViaBrowser(url: string): Promise<{ text: string; error?
 }
 
 // ============================================================
+// download_tweet_images
+// ============================================================
+
+/** Fetch with proxy support (pbs.twimg.com needs proxy in China) */
+const PROXY_URL = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy || "";
+const dispatcher = PROXY_URL ? new ProxyAgent(PROXY_URL) : undefined;
+
+async function fetchWithProxy(url: string): Promise<Response> {
+  if (dispatcher) {
+    return undiciFetch(url, { dispatcher } as any) as unknown as Response;
+  }
+  return globalThis.fetch(url);
+}
+
+async function downloadTweetImages(
+  url: string,
+  outputDir: string = "./images",
+): Promise<{ text: string; error?: string }> {
+  try {
+    // Ensure output dir exists
+    const absDir = path.resolve(outputDir);
+    if (!fs.existsSync(absDir)) fs.mkdirSync(absDir, { recursive: true });
+
+    return await withCdp(async (client) => {
+      await client.Page.navigate({ url });
+      await sleep(5000);
+
+      // Wait for tweet to load
+      for (let wait = 0; wait < 3; wait++) {
+        const { result: checkResult } = await client.Runtime.evaluate({
+          expression: `document.querySelectorAll('article[data-testid="tweet"]').length`,
+        });
+        if ((checkResult as any).value > 0) break;
+        await sleep(3000);
+      }
+
+      // Extract image URLs (exclude avatars/profiles/emoji)
+      const { result } = await client.Runtime.evaluate({
+        expression: `(function() {
+          var articles = document.querySelectorAll('article[data-testid="tweet"]');
+          if (!articles.length) return null;
+          var main = articles[0];
+          var imgs = main.querySelectorAll('img');
+          var mediaUrls = [];
+          var seen = {};
+          imgs.forEach(function(img) {
+            var src = img.getAttribute('src') || '';
+            // Keep only media images, skip avatars/profiles/emoji
+            if (src.includes('pbs.twimg.com/media/') || src.includes('pbs.twimg.com/amplify_video_thumb/')) {
+              var base = src.split('?')[0];
+              if (!seen[base]) {
+                seen[base] = true;
+                // Upgrade to large format
+                var large = src.replace(/name=[^&]+/, 'name=large');
+                mediaUrls.push(large);
+              }
+            }
+          });
+          return JSON.stringify(mediaUrls);
+        })()`,
+      });
+
+      const urls: string[] | null = JSON.parse((result as any).value);
+      if (!urls) return { text: "", error: "未找到推文" };
+      if (urls.length === 0) return { text: "该推文没有配图" };
+
+      // Download images from Node.js (pbs.twimg.com doesn't need cookies)
+      const downloaded: string[] = [];
+      for (let i = 0; i < urls.length; i++) {
+        try {
+          const imgUrl = urls[i];
+          const ext = imgUrl.match(/format=(\w+)/)?.[1] || "jpg";
+          const fileName = `image_${String(i + 1).padStart(2, "0")}.${ext === "png" ? "png" : "jpg"}`;
+          const filePath = path.join(absDir, fileName);
+
+          const res = await fetchWithProxy(imgUrl);
+          if (!res.ok) continue;
+          const buffer = Buffer.from(await res.arrayBuffer());
+          fs.writeFileSync(filePath, buffer);
+          downloaded.push(filePath);
+        } catch {
+          // Skip failed images silently
+        }
+      }
+
+      if (downloaded.length === 0) return { text: "图片下载失败" };
+      return {
+        text: [
+          "🖼️ 下载完成：" + downloaded.length + " 张图片",
+          "",
+          "📁 目录：" + absDir,
+          ...downloaded.map((f) => "  - " + f),
+        ].join("\n"),
+      };
+    });
+  } catch (err: any) {
+    return { text: "", error: err.message };
+  }
+}
+
+// ============================================================
 // MCP Server
 // ============================================================
 
@@ -406,6 +510,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["url"],
       },
     },
+    {
+      name: "download_tweet_images",
+      description: "下载推文中的配图到本地。自动排除头像，只保存媒体图片（原图）。",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          url: { type: "string" as const, description: "推文 URL" },
+          output_dir: { type: "string" as const, description: "保存目录，默认 ./images" },
+        },
+        required: ["url"],
+      },
+    },
   ],
 }));
 
@@ -428,6 +544,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const r = await getArticleContent(url);
     return { content: [{ type: "text", text: r.error ? "Error: " + r.error : r.text }] };
   }
+  if (name === "download_tweet_images") {
+    const url = args?.url as string;
+    if (!url) return { content: [{ type: "text", text: "Error: url is required" }] };
+    const outputDir = (args?.output_dir as string) || "./images";
+    const r = await downloadTweetImages(url, outputDir);
+    return { content: [{ type: "text", text: r.error ? "Error: " + r.error : r.text }] };
+  }
   return { content: [{ type: "text", text: "Unknown tool: " + name }] };
 });
 
@@ -443,6 +566,7 @@ async function cliMain() {
     console.error("  get-tweet <url>        获取推文完整内容");
     console.error("  get-timeline [count]   获取首页推文列表");
     console.error("  get-article <url>      获取文章完整内容");
+    console.error("  download-images <url> [dir] 下载推文配图");
     process.exit(command ? 0 : 1);
   }
   if (command === "get-tweet") {
@@ -460,6 +584,13 @@ async function cliMain() {
   if (command === "get-article") {
     if (!arg) { console.error("Error: url is required"); process.exit(1); }
     const r = await getArticleContent(arg);
+    console.log(r.error ? "Error: " + r.error : r.text);
+    process.exit(r.error ? 1 : 0);
+  }
+  if (command === "download-images") {
+    if (!arg) { console.error("Error: url is required"); process.exit(1); }
+    const dir = process.argv[4] || "./images";
+    const r = await downloadTweetImages(arg, dir);
     console.log(r.error ? "Error: " + r.error : r.text);
     process.exit(r.error ? 1 : 0);
   }
