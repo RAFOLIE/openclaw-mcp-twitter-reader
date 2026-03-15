@@ -1,4 +1,4 @@
-# mcp-twitter-reader
+# openclaw-mcp-twitter-reader
 
 通过已登录的浏览器获取 X (Twitter) 推文全文和外部文章内容。
 
@@ -39,7 +39,7 @@ npx tsx src/index.ts get-article "https://example.com/blog/post"
     "twitter-reader": {
       "command": "npx",
       "args": ["tsx", "src/index.ts"],
-      "cwd": "/path/to/mcp-twitter-reader",
+      "cwd": "/path/to/openclaw-mcp-twitter-reader",
       "env": {
         "CDP_URL": "http://localhost:18800"
       }

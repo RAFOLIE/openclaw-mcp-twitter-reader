@@ -1,5 +1,5 @@
 {
-  "name": "mcp-twitter-reader",
+  "name": "openclaw-mcp-twitter-reader",
   "version": "0.1.0",
   "type": "module",
   "description": "MCP server + CLI for reading Twitter/X tweet content and articles via browser automation",
