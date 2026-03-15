@@ -98,10 +98,29 @@ async function getTweetContent(url: string): Promise<{ text: string; error?: str
           var reply = main.querySelector('[data-testid="reply"]');
           var retweet = main.querySelector('[data-testid="retweet"]');
           var like = main.querySelector('[data-testid="like"]');
+          // Detect quoted tweet: look for a role="link" div with a different user
+          var quotedHandle = '';
+          var quotedLinkHref = '';
+          var mainHandle = (author.split('@')[1] || '').trim();
+          main.querySelectorAll('[role="link"]').forEach(function(d) {
+            var text = d.textContent || '';
+            var href = d.getAttribute('href') || '';
+            // Quoted tweet card has text like "User@handle·date" followed by content
+            // and is NOT the main tweet's own links
+            if (text.includes('@') && text.indexOf('@' + mainHandle) === -1) {
+              var handleMatch = text.match(/@([A-Za-z0-9_]+)/);
+              if (handleMatch) {
+                quotedHandle = handleMatch[1];
+                quotedLinkHref = href;
+              }
+            }
+          });
           return JSON.stringify({
             author: author,
             time: time,
             content: texts.join('\\n\\n'),
+            quotedHandle: quotedHandle,
+            quotedLinkHref: quotedLinkHref,
             replies: reply ? reply.getAttribute('aria-label') : '',
             retweets: retweet ? retweet.getAttribute('aria-label') : '',
             likes: like ? like.getAttribute('aria-label') : '',
@@ -112,17 +131,106 @@ async function getTweetContent(url: string): Promise<{ text: string; error?: str
       const parsed = JSON.parse((result as any).value);
       if (!parsed) return { text: "", error: "未找到推文内容" };
 
-      return {
-        text: [
-          "## " + parsed.author,
-          "📅 " + parsed.time,
-          "",
-          parsed.content,
-          "",
-          "---",
-          "💬 " + parsed.replies + "  🔁 " + parsed.retweets + "  ❤️ " + parsed.likes,
-        ].join("\n"),
-      };
+      // Check for quoted tweet and fetch full content
+      let quotedContent: string | null = null;
+      if (parsed.quotedHandle) {
+        // The quoted tweet card doesn't have a direct href, navigate by handle
+        const quotedUrl = "https://x.com/" + parsed.quotedHandle;
+        // First, try clicking the quoted tweet card to navigate there
+        const { result: clickResult } = await client.Runtime.evaluate({
+          expression: `(function() {
+            var main = document.querySelector('article[data-testid="tweet"]');
+            if (!main) return JSON.stringify({clicked: false});
+            var target = null;
+            main.querySelectorAll('[role="link"]').forEach(function(d) {
+              var text = d.textContent || '';
+              if (text.includes('@${parsed.quotedHandle}') && text.includes('文章')) {
+                target = d;
+              }
+            });
+            if (target) {
+              target.click();
+              return JSON.stringify({clicked: true});
+            }
+            return JSON.stringify({clicked: false});
+          })()`,
+        });
+        const clickParsed = JSON.parse((clickResult as any).value);
+        if (clickParsed?.clicked) {
+          await sleep(4000);
+        } else {
+          // Fallback: direct navigate
+          await client.Page.navigate({ url: quotedUrl });
+          await sleep(4000);
+        }
+
+        // Click "Show more" on quoted tweet
+        for (let i = 0; i < 5; i++) {
+          const { result: smCount } = await client.Runtime.evaluate({
+            expression: `document.querySelectorAll('[data-testid="tweet-text-show-more-link"]').length`,
+          });
+          if ((smCount as any).value === 0) break;
+          await client.Runtime.evaluate({
+            expression: `document.querySelector('[data-testid="tweet-text-show-more-link"]').click()`,
+          });
+          await sleep(2000);
+        }
+
+        // Extract quoted tweet full content
+        // X long-form articles use h1/h2/headings, NOT data-testid="tweetText"
+        const { result: quotedResult } = await client.Runtime.evaluate({
+          expression: `(function() {
+            var articles = document.querySelectorAll('article[data-testid="tweet"]');
+            if (!articles.length) return null;
+            var main = articles[0];
+            var userEl = main.querySelector('[data-testid="User-Name"]');
+            var author = userEl ? userEl.textContent.trim() : '';
+            var timeEl = main.querySelector('time');
+            var time = timeEl ? timeEl.textContent.trim() : '';
+            // Try tweetText first (regular tweets)
+            var texts = [];
+            main.querySelectorAll('[data-testid="tweetText"]').forEach(function(el) {
+              var t = el.textContent.trim();
+              if (t) texts.push(t);
+            });
+            var content = texts.join('\\n\\n');
+            // If no tweetText, it's a long-form article - use full article text
+            if (content.length < 50) {
+              content = main.textContent.trim();
+            }
+            return JSON.stringify({ author: author, time: time, content: content, url: location.href });
+          })()`,
+        });
+
+        const quotedParsed = JSON.parse((quotedResult as any).value);
+        if (quotedParsed) {
+          quotedContent = [
+            "## " + quotedParsed.author,
+            "📅 " + quotedParsed.time,
+            "🔗 " + quotedParsed.url,
+            "",
+            quotedParsed.content,
+          ].join("\n");
+        }
+      }
+
+      // Build final output
+      const parts: string[] = [
+        "## " + parsed.author,
+        "📅 " + parsed.time,
+        "",
+        parsed.content,
+        "",
+        "---",
+        "💬 " + parsed.replies + "  🔁 " + parsed.retweets + "  ❤️ " + parsed.likes,
+      ];
+
+      if (quotedContent) {
+        parts.push("", "═══ 引用推文全文 ═══", "");
+        parts.push(quotedContent);
+      }
+
+      return { text: parts.join("\n") };
     });
   } catch (err: any) {
     return { text: "", error: err.message };
